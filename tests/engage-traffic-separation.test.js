@@ -1,0 +1,17 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import {LiveChatClient} from '../src/livechat.js';
+const server=fs.readFileSync(new URL('../src/server.js',import.meta.url),'utf8');
+const poller=fs.readFileSync(new URL('../src/poller.js',import.meta.url),'utf8');
+const ingress=fs.readFileSync(new URL('../src/livechat-ingress.js',import.meta.url),'utf8');
+const db=fs.readFileSync(new URL('../src/db.js',import.meta.url),'utf8');
+const shell=fs.readFileSync(new URL('../public/assets/js/core/shell.js',import.meta.url),'utf8');
+
+test('provider activity is independent from requester follow state',()=>{const lc=new LiveChatClient({base:'http://local',accountId:'a',pat:'p'});assert.equal(lc.providerActivity({is_followed:true,last_thread_summary:{active:true}}),'CHATTING');assert.equal(lc.providerActivity({is_followed:false,last_thread_summary:{active:true}}),'CHATTING');assert.equal(lc.providerActivity({routing_status:'queued',is_followed:true,last_thread_summary:{active:true}}),'QUEUED');assert.equal(lc.providerActivity({routing_status:'browsing'}),'BROWSING');assert.equal(lc.providerActivity({status:'closed'}),'CLOSED');assert.equal(lc.providerActivity({last_thread_summary:{active:true}}),'CHATTING')});
+test('/conversations requires provider CHATTING and traffic route exists',()=>{assert.match(server,/provider_activity='CHATTING'/);assert.match(server,/\/api\/engage\/traffic/);assert.match(server,/engage\/traffic/);assert.match(shell,/Engage \/ Traffic/)});
+test('queued uses claim lane while chatting gets higher ingress priority',()=>{assert.match(poller,/activity==='CHATTING'[\s\S]{0,220}priority:100/);assert.match(poller,/activity==='QUEUED'[\s\S]{0,260}requestTrafficClaim/);assert.match(ingress,/type==='CLAIM_CHAT'/);assert.match(ingress,/Membership success is not enough/)});
+test('traffic pagination/counters are database-backed and keyset paginated',()=>{assert.match(db,/SELECT provider_activity,count\(\*\)::int AS n/);assert.match(db,/nextCursor/);assert.doesNotMatch(db,/LIMIT \$3 OFFSET \$4/)});
+test('synthetic 5000 traffic classification never promotes queued/browsing to conversations',()=>{const lc=new LiveChatClient({base:'http://local',accountId:'a',pat:'p'});const rows=[];for(let i=0;i<200;i++)rows.push({id:`c${i}`,is_followed:true,last_thread_summary:{active:true}});for(let i=0;i<1000;i++)rows.push({id:`q${i}`,is_followed:false,last_thread_summary:{active:true},routing_status:'queued'});for(let i=0;i<3800;i++)rows.push({id:`b${i}`,routing_status:'browsing'});const counts=rows.reduce((a,x)=>(a[lc.providerActivity(x)]=(a[lc.providerActivity(x)]||0)+1,a),{});assert.equal(rows.length,5000);assert.equal(counts.CHATTING,200);assert.equal(counts.QUEUED,1000);assert.equal(counts.BROWSING,3800)});
+test('queued manual pick reuses durable CLAIM_CHAT lane and UI exposes action',()=>{assert.match(server,/enqueueManualTrafficClaim/);assert.match(db,/requestTrafficClaim/);assert.match(db,/livechat-claim:/);assert.match(db,/job_type='CLAIM_CHAT'/);assert.match(fs.readFileSync(new URL('../public/assets/js/pages/engage-traffic.js',import.meta.url),'utf8'),/Pick from queue/)});
+test('generation guard prevents stale provider classification overwrite',()=>{assert.match(db,/provider_generation=GREATEST\(conversations\.provider_generation,EXCLUDED\.provider_generation\)/);assert.match(db,/WHERE EXCLUDED\.provider_generation>=conversations\.provider_generation/)});
